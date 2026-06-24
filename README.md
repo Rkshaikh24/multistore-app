@@ -1,239 +1,356 @@
-# Shopify App Template - React Router
+# Multistore Shopify Sync — Architecture & Documentation
 
-This is a template for building a [Shopify app](https://shopify.dev/docs/apps/getting-started) using [React Router](https://reactrouter.com/). It was forked from the [Shopify Remix app template](https://github.com/Shopify/shopify-app-template-remix) and converted to React Router.
+## Live Links
 
-Rather than cloning this repo, follow the [Quick Start steps](https://github.com/Shopify/shopify-app-template-react-router#quick-start).
+| Service | URL |
+|---|---|
+| Dashboard (Frontend) | https://multistore-dashboard.vercel.app/ |
+| Backend API (Render) | https://multistore-app-447u.onrender.com |
+| GitHub — App | https://github.com/Rkshaikh24/multistore-app |
+| GitHub — Dashboard | https://github.com/Rkshaikh24/multistore-dashboard |
+| Store A (INR) | https://indi-uf3etlsc.myshopify.com |
+| Store B (AED) | https://unit-lmxnsjsu.myshopify.com |
 
-Visit the [`shopify.dev` documentation](https://shopify.dev/docs/api/shopify-app-react-router) for more details on the React Router app package.
+---
 
-## Upgrading from Remix
+## System Architecture Overview
 
-If you have an existing Remix app that you want to upgrade to React Router, please follow the [upgrade guide](https://github.com/Shopify/shopify-app-template-react-router/wiki/Upgrading-from-Remix). Otherwise, please follow the quick start guide below.
-
-## Quick start
-
-### Prerequisites
-
-Before you begin, you'll need to [download and install the Shopify CLI](https://shopify.dev/docs/apps/tools/cli/getting-started) if you haven't already.
-
-### Setup
-
-```shell
-shopify app init --template=https://github.com/Shopify/shopify-app-template-react-router
+```
+┌─────────────────────┐        ┌─────────────────────┐
+│   Store A (INR)     │        │   Store B (AED)      │
+│  indi-uf3etlsc      │        │  unit-lmxnsjsu       │
+│                     │        │                      │
+│  - 5 Products       │        │  - 5 Products        │
+│  - Matching SKUs    │        │  - Matching SKUs     │
+│  - INR Pricing      │        │  - AED Pricing       │
+│  - Metaobjects      │        │  - Metaobjects       │
+└────────┬────────────┘        └──────────┬───────────┘
+         │  Webhooks                       │  Webhooks
+         │  (orders/create,               │  (orders/create,
+         │   inventory/update,            │   inventory/update,
+         │   products/update)             │   products/update)
+         └──────────────┬─────────────────┘
+                        ▼
+         ┌──────────────────────────────┐
+         │     Express.js Middleware    │
+         │         (Render)             │
+         │                              │
+         │  - Webhook receiver          │
+         │  - GraphQL sync engine       │
+         │  - Rate limit queue          │
+         │  - Deduplication logic       │
+         └──────────────┬───────────────┘
+                        │
+                        ▼
+         ┌──────────────────────────────┐
+         │       Supabase               │
+         │    (PostgreSQL)              │
+         │                              │
+         │  - products table            │
+         │  - orders table              │
+         │  - webhook_logs table        │
+         └──────────────┬───────────────┘
+                        │
+                        ▼
+         ┌──────────────────────────────┐
+         │    React Dashboard           │
+         │       (Vercel)               │
+         │                              │
+         │  - Product Catalog Matrix    │
+         │  - Cross-Store Order Feed    │
+         │  - Live Inventory Updates    │
+         └──────────────────────────────┘
 ```
 
-### Local Development
+---
 
-```shell
-shopify app dev
-```
+## Module 1: Store Setup & Environment Architecture
 
-Press P to open the URL to your app. Once you click install, you can start development.
+### Two Shopify Development Stores
 
-Local development is powered by [the Shopify CLI](https://shopify.dev/docs/apps/tools/cli). It logs into your account, connects to an app, provides environment variables, updates remote config, creates a tunnel and provides commands to generate extensions.
+| Store | Domain | Currency | Market |
+|---|---|---|---|
+| Store A | indi-uf3etlsc.myshopify.com | INR (₹) | Domestic |
+| Store B | unit-lmxnsjsu.myshopify.com | AED (د.إ) | International |
 
-### Authenticating and querying data
+### Shared Product Catalog (Identical SKUs)
 
-To authenticate and query data you can use the `shopify` const that is exported from `/app/shopify.server.js`:
+| SKU | Product Name | Store A Price (INR) | Store B Price (AED) |
+|---|---|---|---|
+| SKU001 | The Collection Snowboard: Liquid | ₹749.95 | AED 30 |
+| SKU002 | The 3p Fulfilled Snowboard | ₹2629.95 | AED 40 |
+| SKU003 | The Multi-managed Snowboard | ₹629.95 | AED 30 |
+| SKU004 | The Collection Snowboard: Oxygen | ₹1025 | AED 50 |
+| SKU005 | The Multi-location Snowboard | ₹729.95 | AED 20 |
 
-```js
-export async function loader({ request }) {
-  const { admin } = await shopify.authenticate.admin(request);
+### Metaobject Schema
 
-  const response = await admin.graphql(`
-    {
-      products(first: 25) {
-        nodes {
-          title
-          description
+A `extended_product_specifications` Metaobject definition was created on both stores via the Admin GraphQL API with the following fields:
+
+- `washing_instructions` (single_line_text_field)
+- `dimensions` (single_line_text_field)
+- `material_blend` (single_line_text_field)
+
+---
+
+## Module 2: Custom Shopify App & Webhook Engine
+
+### Authentication & Data Fetching
+
+All data fetching uses the **Shopify Admin GraphQL API exclusively** — no REST endpoints are used. Each store has a dedicated Custom App installed with the following OAuth scopes:
+
+- `read_products` / `write_products`
+- `read_inventory` / `write_inventory`
+- `read_orders` / `write_orders`
+- `read_locations`
+
+### GraphQL Query Example
+
+```graphql
+query {
+  products(first: 10) {
+    edges {
+      node {
+        id
+        title
+        variants(first: 5) {
+          edges {
+            node {
+              sku
+              price
+              inventoryQuantity
+              inventoryItem {
+                id
+              }
+            }
+          }
         }
       }
-    }`);
-
-  const {
-    data: {
-      products: { nodes },
-    },
-  } = await response.json();
-
-  return nodes;
+    }
+  }
 }
 ```
 
-This template comes pre-configured with examples of:
+### Rate Limiting — Leaky Bucket Implementation
 
-1. Setting up your Shopify app in [/app/shopify.server.ts](https://github.com/Shopify/shopify-app-template-react-router/blob/main/app/shopify.server.ts)
-2. Querying data using Graphql. Please see: [/app/routes/app.\_index.tsx](https://github.com/Shopify/shopify-app-template-react-router/blob/main/app/routes/app._index.tsx).
-3. Responding to webhooks. Please see [/app/routes/webhooks.tsx](https://github.com/Shopify/shopify-app-template-react-router/blob/main/app/routes/webhooks.app.uninstalled.tsx).
-4. Using metafields, metaobjects, and declarative custom data definitions. Please see [/app/routes/app.\_index.tsx](https://github.com/Shopify/shopify-app-template-react-router/blob/main/app/routes/app._index.tsx) and [shopify.app.toml](https://github.com/Shopify/shopify-app-template-react-router/blob/main/shopify.app.toml).
+To handle high-volume flash sale scenarios, all GraphQL requests are routed through a `p-queue` based rate limiter:
 
-Please read the [documentation for @shopify/shopify-app-react-router](https://shopify.dev/docs/api/shopify-app-react-router) to see what other API's are available.
+```javascript
+import PQueue from 'p-queue';
 
-## Shopify Dev MCP
+// Max 10 requests per second — respects Shopify's leaky bucket
+const queue = new PQueue({ intervalCap: 10, interval: 1000 });
 
-This template is configured with the Shopify Dev MCP. This instructs [Cursor](https://cursor.com/), [GitHub Copilot](https://github.com/features/copilot) and [Claude Code](https://claude.com/product/claude-code) and [Google Gemini CLI](https://github.com/google-gemini/gemini-cli) to use the Shopify Dev MCP.
-
-For more information on the Shopify Dev MCP please read [the documentation](https://shopify.dev/docs/apps/build/devmcp).
-
-## Deployment
-
-### Application Storage
-
-This template uses [Prisma](https://www.prisma.io/) to store session data, by default using an [SQLite](https://www.sqlite.org/index.html) database.
-The database is defined as a Prisma schema in `prisma/schema.prisma`.
-
-This use of SQLite works in production if your app runs as a single instance.
-The database that works best for you depends on the data your app needs and how it is queried.
-Here’s a short list of databases providers that provide a free tier to get started:
-
-| Database   | Type             | Hosters                                                                                                                                                                                                                                    |
-| ---------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| MySQL      | SQL              | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-mysql), [Planet Scale](https://planetscale.com/), [Amazon Aurora](https://aws.amazon.com/rds/aurora/), [Google Cloud SQL](https://cloud.google.com/sql/docs/mysql) |
-| PostgreSQL | SQL              | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-postgresql), [Amazon Aurora](https://aws.amazon.com/rds/aurora/), [Google Cloud SQL](https://cloud.google.com/sql/docs/postgres)                                   |
-| Redis      | Key-value        | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-redis), [Amazon MemoryDB](https://aws.amazon.com/memorydb/)                                                                                                        |
-| MongoDB    | NoSQL / Document | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-mongodb), [MongoDB Atlas](https://www.mongodb.com/atlas/database)                                                                                                  |
-
-To use one of these, you can use a different [datasource provider](https://www.prisma.io/docs/reference/api-reference/prisma-schema-reference#datasource) in your `schema.prisma` file, or a different [SessionStorage adapter package](https://github.com/Shopify/shopify-api-js/blob/main/packages/shopify-api/docs/guides/session-storage.md).
-
-### Build
-
-Build the app by running the command below with the package manager of your choice:
-
-Using yarn:
-
-```shell
-yarn build
+export async function queryShopify(store, query, variables = {}) {
+  return queue.add(async () => {
+    // GraphQL fetch here
+  });
+}
 ```
 
-Using npm:
+This ensures that during flash sales with concurrent inventory updates, requests are throttled to stay within Shopify's GraphQL cost limits (2000 points/second restore rate).
 
-```shell
-npm run build
+### Registered Webhooks
+
+| Topic | Endpoint | Both Stores |
+|---|---|---|
+| `orders/create` | `/webhooks/orders/create` | ✅ |
+| `inventory_levels/update` | `/webhooks/inventory/update` | ✅ |
+| `products/update` | `/webhooks/products/update` | ✅ |
+
+---
+
+## Module 3: Middleware Dashboard & Cloud Deployment
+
+### Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Node.js + Express.js |
+| Frontend | React + Tailwind CSS + Vite |
+| Database | Supabase (PostgreSQL) |
+| Backend Hosting | Render (free tier) |
+| Frontend Hosting | Vercel (free tier) |
+| Queue | p-queue (leaky bucket) |
+
+### Database Schema
+
+```sql
+-- Products: deduplication via composite unique key
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  shopify_product_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  price DECIMAL(10,2) NOT NULL,
+  currency TEXT NOT NULL,
+  inventory INTEGER DEFAULT 0,
+  inventory_item_id TEXT,
+  store_origin TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(sku, store_origin)       -- ← deduplication key
+);
+
+-- Orders: deduplication via composite unique key
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  shopify_order_id TEXT NOT NULL,
+  store_origin TEXT NOT NULL,
+  total_price DECIMAL(10,2) NOT NULL,
+  currency TEXT NOT NULL,
+  line_items JSONB,
+  status TEXT DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(shopify_order_id, store_origin)  -- ← deduplication key
+);
+
+-- Webhook logs: for failure tracking and retry
+CREATE TABLE webhook_logs (
+  id SERIAL PRIMARY KEY,
+  store_origin TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  payload JSONB,
+  status TEXT DEFAULT 'pending',
+  retry_count INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  processed_at TIMESTAMP
+);
 ```
 
-Using pnpm:
+---
 
-```shell
-pnpm run build
+## Webhook Failure Handling & Retry Strategy
+
+### How Webhook Failures Are Handled
+
+Every incoming webhook is immediately logged to the `webhook_logs` table with `status: 'processing'` before any business logic runs. This ensures no event is silently lost.
+
+```javascript
+// Step 1: Log immediately on receipt
+await supabase.from('webhook_logs').insert({
+  store_origin,
+  topic: 'orders/create',
+  payload: order,
+  status: 'processing',
+});
+
+// Step 2: Process business logic
+await supabase.from('orders').upsert({ ... });
+
+// Step 3: Mark as processed
+await supabase.from('webhook_logs')
+  .update({ status: 'processed', processed_at: new Date() })
+  .eq('status', 'processing');
 ```
 
-## Hosting
+If Step 2 fails, the log entry remains as `status: 'processing'` or is updated to `status: 'failed'`. A background retry job can query for all failed/pending entries and reprocess them:
 
-When you're ready to set up your app in production, you can follow [our deployment documentation](https://shopify.dev/docs/apps/launch/deployment) to host it externally. From there, you have a few options:
-
-- [Google Cloud Run](https://shopify.dev/docs/apps/launch/deployment/deploy-to-google-cloud-run): This tutorial is written specifically for this example repo, and is compatible with the extended steps included in the subsequent [**Build your app**](tutorial) in the **Getting started** docs. It is the most detailed tutorial for taking a React Router-based Shopify app and deploying it to production. It includes configuring permissions and secrets, setting up a production database, and even hosting your apps behind a load balancer across multiple regions.
-- [Fly.io](https://fly.io/docs/js/shopify/): Leverages the Fly.io CLI to quickly launch Shopify apps to a single machine.
-- [Render](https://render.com/docs/deploy-shopify-app): This tutorial guides you through using Docker to deploy and install apps on a Dev store.
-- [Manual deployment guide](https://shopify.dev/docs/apps/launch/deployment/deploy-to-hosting-service): This resource provides general guidance on the requirements of deployment including environment variables, secrets, and persistent data.
-
-When you reach the step for [setting up environment variables](https://shopify.dev/docs/apps/deployment/web#set-env-vars), you also need to set the variable `NODE_ENV=production`.
-
-## Gotchas / Troubleshooting
-
-### Database tables don't exist
-
-If you get an error like:
-
-```
-The table `main.Session` does not exist in the current database.
+```javascript
+// Retry query
+const { data: failed } = await supabase
+  .from('webhook_logs')
+  .select('*')
+  .eq('status', 'failed')
+  .lt('retry_count', 3);  // max 3 retries
 ```
 
-Create the database for Prisma. Run the `setup` script in `package.json` using `npm`, `yarn` or `pnpm`.
+### Shopify's Built-in Retry Behaviour
 
-### Navigating/redirecting breaks an embedded app
+Shopify automatically retries failed webhook deliveries (non-2xx responses) up to 19 times over 48 hours with exponential backoff. Our system returns `500` on failure, which triggers Shopify's retry mechanism as a secondary safety net.
 
-Embedded apps must maintain the user session, which can be tricky inside an iFrame. To avoid issues:
+---
 
-1. Use `Link` from `react-router` or `@shopify/polaris`. Do not use `<a>`.
-2. Use `redirect` returned from `authenticate.admin`. Do not use `redirect` from `react-router`
-3. Use `useSubmit` from `react-router`.
+## Data Deduplication Logic
 
-This only applies if your app is embedded, which it will be by default.
+### Problem
 
-### Webhooks: shop-specific webhook subscriptions aren't updated
+Both Store A and Store B carry the same 5 SKUs. A naive implementation would either overwrite Store A's data with Store B's or treat them as duplicate records.
 
-If you are registering webhooks in the `afterAuth` hook, using `shopify.registerWebhooks`, you may find that your subscriptions aren't being updated.
+### Solution — Composite Unique Key
 
-Instead of using the `afterAuth` hook declare app-specific webhooks in the `shopify.app.toml` file. This approach is easier since Shopify will automatically sync changes every time you run `deploy` (e.g: `npm run deploy`). Please read these guides to understand more:
+The `products` table uses a **composite unique key** on `(sku, store_origin)`:
 
-1. [app-specific vs shop-specific webhooks](https://shopify.dev/docs/apps/build/webhooks/subscribe#app-specific-subscriptions)
-2. [Create a subscription tutorial](https://shopify.dev/docs/apps/build/webhooks/subscribe/get-started?deliveryMethod=https)
-
-If you do need shop-specific webhooks, keep in mind that the package calls `afterAuth` in 2 scenarios:
-
-- After installing the app
-- When an access token expires
-
-During normal development, the app won't need to re-authenticate most of the time, so shop-specific subscriptions aren't updated. To force your app to update the subscriptions, uninstall and reinstall the app. Revisiting the app will call the `afterAuth` hook.
-
-### Webhooks: Admin created webhook failing HMAC validation
-
-Webhooks subscriptions created in the [Shopify admin](https://help.shopify.com/en/manual/orders/notifications/webhooks) will fail HMAC validation. This is because the webhook payload is not signed with your app's secret key.
-
-The recommended solution is to use [app-specific webhooks](https://shopify.dev/docs/apps/build/webhooks/subscribe#app-specific-subscriptions) defined in your toml file instead. Test your webhooks by triggering events manually in the Shopify admin(e.g. Updating the product title to trigger a `PRODUCTS_UPDATE`).
-
-### Webhooks: Admin object undefined on webhook events triggered by the CLI
-
-When you trigger a webhook event using the Shopify CLI, the `admin` object will be `undefined`. This is because the CLI triggers an event with a valid, but non-existent, shop. The `admin` object is only available when the webhook is triggered by a shop that has installed the app. This is expected.
-
-Webhooks triggered by the CLI are intended for initial experimentation testing of your webhook configuration. For more information on how to test your webhooks, see the [Shopify CLI documentation](https://shopify.dev/docs/apps/tools/cli/commands#webhook-trigger).
-
-### Incorrect GraphQL Hints
-
-By default the [graphql.vscode-graphql](https://marketplace.visualstudio.com/items?itemName=GraphQL.vscode-graphql) extension for will assume that GraphQL queries or mutations are for the [Shopify Admin API](https://shopify.dev/docs/api/admin). This is a sensible default, but it may not be true if:
-
-1. You use another Shopify API such as the storefront API.
-2. You use a third party GraphQL API.
-
-If so, please update [.graphqlrc.ts](https://github.com/Shopify/shopify-app-template-react-router/blob/main/.graphqlrc.ts).
-
-### Using Defer & await for streaming responses
-
-By default the CLI uses a cloudflare tunnel. Unfortunately cloudflare tunnels wait for the Response stream to finish, then sends one chunk. This will not affect production.
-
-To test [streaming using await](https://reactrouter.com/api/components/Await#await) during local development we recommend [localhost based development](https://shopify.dev/docs/apps/build/cli-for-apps/networking-options#localhost-based-development).
-
-### "nbf" claim timestamp check failed
-
-This is because a JWT token is expired. If you are consistently getting this error, it could be that the clock on your machine is not in sync with the server. To fix this ensure you have enabled "Set time and date automatically" in the "Date and Time" settings on your computer.
-
-### Using MongoDB and Prisma
-
-If you choose to use MongoDB with Prisma, there are some gotchas in Prisma's MongoDB support to be aware of. Please see the [Prisma SessionStorage README](https://www.npmjs.com/package/@shopify/shopify-app-session-storage-prisma#mongodb).
-
-### Unable to require(`C:\...\query_engine-windows.dll.node`).
-
-Unable to require(`C:\...\query_engine-windows.dll.node`).
-The Prisma engines do not seem to be compatible with your system.
-
-query_engine-windows.dll.node is not a valid Win32 application.
-
-**Fix:** Set the environment variable:
-
-```shell
-PRISMA_CLIENT_ENGINE_TYPE=binary
+```sql
+UNIQUE(sku, store_origin)
 ```
 
-This forces Prisma to use the binary engine mode, which runs the query engine as a separate process and can work via emulation on Windows ARM64.
+This means `SKU001` from `store_a` and `SKU001` from `store_b` are stored as **two distinct rows** representing two distinct retail endpoints of the same physical product:
 
-## Resources
+```
+| sku    | store_origin | price   | currency | inventory |
+|--------|--------------|---------|----------|-----------|
+| SKU001 | store_a      | 749.95  | INR      | 44        |
+| SKU001 | store_b      | 30.00   | AED      | 50        |
+```
 
-React Router:
+### Upsert Strategy for Concurrent Updates
 
-- [React Router docs](https://reactrouter.com/home)
+During flash sales with rapid concurrent inventory updates, all writes use `upsert` with `onConflict`:
 
-Shopify:
+```javascript
+await supabase
+  .from('products')
+  .upsert(productsToUpsert, { onConflict: 'sku,store_origin' });
+```
 
-- [Intro to Shopify apps](https://shopify.dev/docs/apps/getting-started)
-- [Shopify App React Router docs](https://shopify.dev/docs/api/shopify-app-react-router)
-- [Shopify CLI](https://shopify.dev/docs/apps/tools/cli)
-- [Shopify App Bridge](https://shopify.dev/docs/api/app-bridge-library).
-- [Polaris Web Components](https://shopify.dev/docs/api/app-home/polaris-web-components).
-- [App extensions](https://shopify.dev/docs/apps/app-extensions/list)
-- [Shopify Functions](https://shopify.dev/docs/api/functions)
+This means even if the same webhook fires multiple times (e.g., Shopify retries), the latest inventory value simply overwrites the previous one without creating duplicates. PostgreSQL's atomic upsert guarantees no race conditions at the database level.
 
-Internationalization:
+### Order Deduplication
 
-- [Internationalizing your app](https://shopify.dev/docs/apps/best-practices/internationalization/getting-started)
-#   m u l t i s t o r e - a p p  
- 
+Orders use `UNIQUE(shopify_order_id, store_origin)` — so even if the `orders/create` webhook fires twice for the same order (Shopify occasionally sends duplicate webhooks), the second upsert is a no-op.
+
+---
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Health check |
+| GET | `/api/products` | Get all products from DB |
+| GET | `/api/products/sync` | Sync products from both stores |
+| GET | `/api/orders` | Get all orders from DB |
+| POST | `/webhooks/orders/create` | Receive order webhooks |
+| POST | `/webhooks/inventory/update` | Receive inventory webhooks |
+| POST | `/webhooks/products/update` | Receive product update webhooks |
+
+---
+
+## Environment Variables
+
+```env
+STORE_A_SHOP=indi-uf3etlsc.myshopify.com
+STORE_A_ACCESS_TOKEN=***
+STORE_B_SHOP=unit-lmxnsjsu.myshopify.com
+STORE_B_ACCESS_TOKEN=***
+SHOPIFY_API_KEY=***
+SHOPIFY_API_SECRET=***
+SUPABASE_URL=***
+SUPABASE_ANON_KEY=***
+PORT=3000
+APP_URL=https://your-render-url.onrender.com
+```
+
+---
+
+## Local Development Setup
+
+```bash
+# Clone the repo
+git clone https://github.com/Rkshaikh24/multistore-app.git
+cd multistore-app
+
+# Install dependencies
+npm install
+
+# Create .env file and fill in credentials
+cp .env.example .env
+
+# Start the server
+node server/index.js
+
+# In a separate terminal — start the dashboard
+cd dashboard
+npm install
+npm run dev
+```
